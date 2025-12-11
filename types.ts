@@ -3,21 +3,40 @@ export interface Point {
   y: number;
 }
 
-export enum ToolType {
+export enum ToolMode {
   SELECT = 'SELECT',
   CALIBRATE = 'CALIBRATE',
-  WALL = 'WALL',
-  AREA = 'AREA',
+  DRAW = 'DRAW',
+}
+
+export type GeometryType = 'linear' | 'area' | 'point';
+
+export type MaterialCategory = 'wall' | 'floor' | 'structure' | 'finish' | 'roof' | 'measure';
+
+export interface Material {
+  id: string;
+  name: string;
+  category: MaterialCategory;
+  type: GeometryType;
+  width?: number; // Width in meters (for walls/beams)
+  color: string;
+  opacity?: number;
+  height?: number; // Optional default height in meters
 }
 
 export interface Shape {
   id: string;
-  type: ToolType;
+  materialId: string; // Reference to the material used
   points: Point[];
-  color: string;
   closed: boolean;
-  name?: string;
-  value?: number; // Pre-calculated value (pixels)
+  geometryType: GeometryType;
+  hidden?: boolean;
+}
+
+export interface Sheet {
+  id: string;
+  name: string;
+  shapes: Shape[];
 }
 
 export interface ImageState {

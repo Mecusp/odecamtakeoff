@@ -1,29 +1,48 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Stage, Layer, Image as KonvaImage, Line, Circle, Group, Text, Rect } from 'react-konva';
+import { Stage, Layer, Image as KonvaImage, Line, Circle, Group, Text, Rect, Path } from 'react-konva';
 import useImage from 'use-image';
 import Konva from 'konva';
-import { ImageState, Point, Shape, ToolType } from '../types';
-import { getDistance, formatMeters } from '../utils/math';
+import { ImageState, Point, Shape, ToolMode, Material } from '../types';
+import { getDistance, formatMeters, getPolylineLength, getPolygonArea, formatSquareMeters } from '../utils/math';
 
 interface TakeoffCanvasProps {
   imageState: ImageState | null;
-  tool: ToolType;
+  mode: ToolMode;
+  selectedMaterial: Material;
   shapes: Shape[];
   onShapeAdd: (shape: Shape) => void;
   scale: number | null;
   onCalibrationFinish: (pixels: number) => void;
+  selectedShapeId: string | null;
+  onSelectShape: (id: string | null) => void;
+  onRemoveShape: (id: string) => void;
+  isSnappingEnabled: boolean;
+  
+  // New props for ephemeral measurements
+  tempMeasureShape: Shape | null;
+  setTempMeasureShape: (shape: Shape | null) => void;
+
+  // New: List of all materials to resolve colors
+  materials: Material[];
 }
 
-// Reduzido de 15 para 6 para ser mais sutil e preciso
-const SNAP_THRESHOLD = 6; 
+const SNAP_THRESHOLD = 5; 
 
 export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
   imageState,
-  tool,
+  mode,
+  selectedMaterial,
   shapes,
   onShapeAdd,
   scale,
   onCalibrationFinish,
+  selectedShapeId,
+  onSelectShape,
+  onRemoveShape,
+  isSnappingEnabled,
+  tempMeasureShape,
+  setTempMeasureShape,
+  materials
 }) => {
   const [image] = useImage(imageState?.url || '', 'anonymous');
   const stageRef = useRef<Konva.Stage>(null);
@@ -31,44 +50,73 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
   const [mousePos, setMousePos] = useState<Point | null>(null);
   const [snappedPos, setSnappedPos] = useState<Point | null>(null);
   
-  // Reset current drawing when tool changes
+  // Reset current drawing when mode changes or tool changes
   useEffect(() => {
     setCurrentPoints([]);
     setMousePos(null);
     setSnappedPos(null);
-  }, [tool]);
+    // Important: We also clear the ephemeral measurement result when changing tools
+    if(tempMeasureShape) {
+        setTempMeasureShape(null);
+    }
+  }, [mode, selectedMaterial]);
 
-  // Handle ESC key to cancel current drawing
+  // Handle Keys (ESC, DELETE, ENTER)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setCurrentPoints([]);
-        setSnappedPos(null);
+        if (currentPoints.length > 0) {
+          setCurrentPoints([]);
+          setSnappedPos(null);
+        } else if (tempMeasureShape) {
+          setTempMeasureShape(null);
+        } else {
+          onSelectShape(null);
+        }
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedShapeId) {
+        onRemoveShape(selectedShapeId);
+      }
+      if (e.key === 'Enter') {
+         if (mode === ToolMode.DRAW && currentPoints.length > 0) {
+             // Logic handling for generic finish...
+             if (selectedMaterial.category !== 'measure') {
+                if (selectedMaterial.type === 'linear' && currentPoints.length > 1) {
+                    finishShape(false);
+                } else if (selectedMaterial.type === 'area' && currentPoints.length > 2) {
+                    finishShape(true);
+                }
+             } else {
+                 // Manual enter finish for measure area
+                 if (selectedMaterial.type === 'area' && currentPoints.length > 2) {
+                     finishEphemeralShape(true);
+                 }
+             }
+         }
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [selectedShapeId, currentPoints, mode, selectedMaterial, tempMeasureShape]);
 
-  // Helper to find nearest point to snap to
+  // Universal Snapping Logic
   const getNearestPoint = (pos: Point): Point | null => {
     let nearest: Point | null = null;
     let minDist = SNAP_THRESHOLD;
 
-    // 1. Check points in the current shape (for closing polygons)
-    if (currentPoints.length > 2 && tool === ToolType.AREA) {
-      const startPoint = currentPoints[0];
-      const dist = getDistance(pos, startPoint);
-      if (dist < minDist) {
-        minDist = dist;
-        nearest = startPoint;
-      }
+    // 1. Check start of current drawing (closing polygon)
+    if (currentPoints.length > 0) {
+        const startPoint = currentPoints[0];
+        const dist = getDistance(pos, startPoint);
+        if (dist < minDist) {
+            minDist = dist;
+            nearest = startPoint;
+        }
     }
 
-    // 2. Check points in existing shapes (to connect walls)
-    // We only check endpoints of existing shapes to reduce complexity
+    // 2. Check all committed shapes
     shapes.forEach(shape => {
+      if (shape.hidden) return; // Ignore hidden shapes for snapping
       shape.points.forEach(p => {
         const dist = getDistance(pos, p);
         if (dist < minDist) {
@@ -82,37 +130,106 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
   };
 
   const handleStageClick = (e: Konva.KonvaEventObject<MouseEvent>) => {
-    if (tool === ToolType.SELECT || !imageState) return;
-
     const stage = e.target.getStage();
     if (!stage) return;
     
-    // Determine the actual point to use (snapped or raw)
+    // If clicking on empty space in SELECT mode, deselect
+    if (mode === ToolMode.SELECT) {
+       if (e.target instanceof Konva.Image) {
+           onSelectShape(null);
+       }
+       return;
+    }
+    
+    if (!imageState) return;
+
     const effectivePos = snappedPos || getPointerPos(stage);
 
-    // Handle Closing Polygons for Area
-    if (tool === ToolType.AREA && currentPoints.length > 2) {
-      const firstPoint = currentPoints[0];
-      const dist = getDistance(effectivePos, firstPoint);
-      
-      // If we clicked on the start point (snapped or close enough), close it
-      if (dist < SNAP_THRESHOLD || (snappedPos && snappedPos.x === firstPoint.x && snappedPos.y === firstPoint.y)) {
-        finishShape(true);
+    // --- LOGIC: EPHEMERAL MEASUREMENT (Transiente) ---
+    if (mode === ToolMode.DRAW && selectedMaterial.category === 'measure') {
+        
+        // If there's already a result on screen, a new click clears it to start fresh
+        if (tempMeasureShape) {
+            setTempMeasureShape(null);
+            setCurrentPoints([effectivePos]); // Start new immediately
+            return;
+        }
+
+        // Linear Measure: 2 Points Rule
+        if (selectedMaterial.type === 'linear') {
+            if (currentPoints.length === 0) {
+                // Point 1: Start
+                setCurrentPoints([effectivePos]);
+            } else {
+                // Point 2: End (Finish immediately)
+                const finalPoints = [currentPoints[0], effectivePos];
+                finishEphemeralShape(false, finalPoints);
+            }
+            return;
+        }
+
+        // Area Measure: Polygon Logic
+        if (selectedMaterial.type === 'area') {
+             // Closing Logic
+            if (currentPoints.length > 2) {
+                const firstPoint = currentPoints[0];
+                const dist = getDistance(effectivePos, firstPoint);
+                if (dist < SNAP_THRESHOLD || (snappedPos && snappedPos.x === firstPoint.x && snappedPos.y === firstPoint.y)) {
+                    finishEphemeralShape(true);
+                    return;
+                }
+            }
+            setCurrentPoints([...currentPoints, effectivePos]);
+            return;
+        }
+    }
+
+    // --- LOGIC: STANDARD TAKEOFF ---
+    // POINT GEOMETRY
+    if (mode === ToolMode.DRAW && selectedMaterial.type === 'point') {
+        onShapeAdd({
+            id: Date.now().toString(),
+            materialId: selectedMaterial.id,
+            points: [effectivePos],
+            closed: true,
+            geometryType: 'point'
+        });
         return;
-      }
     }
 
-    // Handle Calibration (2 points only)
-    if (tool === ToolType.CALIBRATE && currentPoints.length === 1) {
-      const newPoints = [...currentPoints, effectivePos];
-      setCurrentPoints([]); // Clear visual temp line
-      
-      const distPx = getDistance(newPoints[0], newPoints[1]);
-      onCalibrationFinish(distPx);
-      return;
-    }
+    // LINEAR / AREA GEOMETRY (Standard)
+    if (mode === ToolMode.DRAW || mode === ToolMode.CALIBRATE) {
+        // Closing Logic for Areas
+        if (selectedMaterial.type === 'area' && currentPoints.length > 2) {
+            const firstPoint = currentPoints[0];
+            const dist = getDistance(effectivePos, firstPoint);
+            
+            if (dist < SNAP_THRESHOLD || (snappedPos && snappedPos.x === firstPoint.x && snappedPos.y === firstPoint.y)) {
+                finishShape(true);
+                return;
+            }
+        }
+        
+        // Linear double click simulation
+        if (selectedMaterial.type === 'linear' && currentPoints.length > 0) {
+            const lastPoint = currentPoints[currentPoints.length - 1];
+             if (getDistance(effectivePos, lastPoint) < 5) {
+                 if (currentPoints.length > 1) finishShape(false);
+                 return;
+             }
+        }
 
-    setCurrentPoints([...currentPoints, effectivePos]);
+        // Calibration Logic
+        if (mode === ToolMode.CALIBRATE && currentPoints.length === 1) {
+            const newPoints = [...currentPoints, effectivePos];
+            setCurrentPoints([]);
+            const distPx = getDistance(newPoints[0], newPoints[1]);
+            onCalibrationFinish(distPx);
+            return;
+        }
+
+        setCurrentPoints([...currentPoints, effectivePos]);
+    }
   };
 
   const getPointerPos = (stage: Konva.Stage) => {
@@ -122,90 +239,138 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
   };
 
   const handleMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
-    if (tool === ToolType.SELECT) return;
+    if (mode === ToolMode.SELECT) return;
     const stage = e.target.getStage();
     if (!stage) return;
     
     const rawPos = getPointerPos(stage);
-    const snap = getNearestPoint(rawPos);
+    const isCtrlPressed = e.evt.ctrlKey || e.evt.metaKey;
+    const shouldSnap = isSnappingEnabled ? !isCtrlPressed : isCtrlPressed;
+
+    let snap = null;
+    if (shouldSnap) {
+        snap = getNearestPoint(rawPos);
+    }
 
     setMousePos(rawPos);
     setSnappedPos(snap);
   };
 
-  const handleDoubleClick = () => {
-    if (tool === ToolType.WALL && currentPoints.length > 1) {
-      finishShape(false);
-    }
+  const handleDoubleClick = (e: Konva.KonvaEventObject<MouseEvent>) => {
+      e.cancelBubble = true; 
+      
+      // Standard Finish (not measure)
+      if (mode === ToolMode.DRAW && selectedMaterial.category !== 'measure' && selectedMaterial.type === 'linear' && currentPoints.length > 1) {
+          finishShape(false);
+      }
   };
 
   const finishShape = (closed: boolean) => {
     const newShape: Shape = {
       id: Date.now().toString(),
-      type: tool,
-      points: currentPoints,
-      color: tool === ToolType.WALL ? '#ef4444' : '#3b82f6',
-      closed: closed
+      materialId: selectedMaterial.id,
+      points: [...currentPoints],
+      closed: closed,
+      geometryType: selectedMaterial.type
     };
     onShapeAdd(newShape);
     setCurrentPoints([]);
     setSnappedPos(null);
   };
 
-  // Render Logic
+  const finishEphemeralShape = (closed: boolean, specificPoints?: Point[]) => {
+      const pts = specificPoints || [...currentPoints];
+      const newShape: Shape = {
+          id: 'temp-measure',
+          materialId: selectedMaterial.id,
+          points: pts,
+          closed: closed,
+          geometryType: selectedMaterial.type
+      };
+      setTempMeasureShape(newShape);
+      setCurrentPoints([]);
+      setSnappedPos(null);
+  }
+
+  const getStrokeWidth = (material?: Material) => {
+      const zoom = stageRef.current?.scaleX() || 1;
+      const basePx = 2 / zoom; 
+
+      if (!scale || !material || !material.width) return Math.max(basePx, 4 / zoom);
+      return Math.max(basePx, material.width * scale);
+  };
+  
+  const getShapeCenter = (shape: Shape): Point => {
+      if (shape.geometryType === 'point') return shape.points[0];
+      if (shape.geometryType === 'linear') {
+          // Midpoint of the total line is hard, let's just use midpoint of first and last for simplicity or midpoint of segment
+          const p1 = shape.points[0];
+          const p2 = shape.points[shape.points.length - 1];
+          return { x: (p1.x + p2.x)/2, y: (p1.y + p2.y)/2 };
+      }
+      
+      let sx = 0, sy = 0;
+      shape.points.forEach(p => { sx += p.x; sy += p.y; });
+      return { x: sx / shape.points.length, y: sy / shape.points.length };
+  };
+
+  // --- RENDERING ---
+
   const renderCurrentShape = () => {
     if (currentPoints.length === 0) return null;
-
-    // Use snapped position for the "rubber band" line if available, otherwise raw mouse pos
     const endPoint = snappedPos || mousePos;
     if (!endPoint) return null;
 
     const pointsToDraw = [...currentPoints, endPoint];
     const flatPoints = pointsToDraw.flatMap(p => [p.x, p.y]);
     
-    // Calculate live length
-    const currentSegmentLength = scale 
-        ? getDistance(currentPoints[currentPoints.length - 1], endPoint) / scale 
-        : 0;
+    const isClosing = selectedMaterial.type === 'area' && snappedPos && currentPoints.length > 2 && snappedPos === currentPoints[0];
+    const strokeWidth = getStrokeWidth(selectedMaterial);
+    const zoom = stageRef.current?.scaleX() || 1;
     
-    // If closing polygon, show "FECHAR"
-    const isClosing = tool === ToolType.AREA && snappedPos && currentPoints.length > 2 && snappedPos === currentPoints[0];
+    // Different visual style for Measurement tool
+    const isMeasureTool = selectedMaterial.category === 'measure';
+    const strokeColor = isMeasureTool ? '#ec4899' : selectedMaterial.color;
 
     return (
       <Group>
         <Line
           points={flatPoints}
-          stroke={tool === ToolType.WALL ? '#ef4444' : tool === ToolType.AREA ? '#3b82f6' : '#f59e0b'}
-          strokeWidth={2 / (stageRef.current?.scaleX() || 1)}
-          dash={tool === ToolType.CALIBRATE ? [10, 5] : []}
+          stroke={mode === ToolMode.CALIBRATE ? '#f59e0b' : strokeColor}
+          strokeWidth={strokeWidth}
+          opacity={selectedMaterial.type === 'area' ? 0.7 : 1}
+          dash={mode === ToolMode.CALIBRATE || isMeasureTool ? [10, 5] : []}
           closed={false}
+          lineCap="round"
+          lineJoin="round"
         />
         {pointsToDraw.map((p, i) => (
           <Circle
             key={i}
             x={p.x}
             y={p.y}
-            radius={3 / (stageRef.current?.scaleX() || 1)}
+            radius={3 / zoom}
             fill="white"
             stroke="black"
-            strokeWidth={1}
+            strokeWidth={1 / zoom}
           />
         ))}
-        {/* Tooltip for current action */}
         {endPoint && (
-            <Group x={endPoint.x + 10} y={endPoint.y + 10}>
+            <Group x={endPoint.x + 10 / zoom} y={endPoint.y + 10 / zoom}>
                 <Rect 
                     fill="rgba(0,0,0,0.8)" 
-                    cornerRadius={4}
-                    width={isClosing ? 60 : 60}
-                    height={20}
+                    cornerRadius={4 / zoom}
+                    width={isClosing ? 60 / zoom : 90 / zoom}
+                    height={24 / zoom}
                     offsetY={-5}
                 />
                 <Text 
-                    text={isClosing ? "FECHAR" : scale ? formatMeters(currentSegmentLength) : "..."}
-                    fontSize={12}
+                    text={isClosing ? "FECHAR" : selectedMaterial.type === 'linear' && isMeasureTool ? "Clique Final" : "..."}
+                    fontSize={10 / zoom}
                     fill="white"
-                    padding={4}
+                    padding={4 / zoom}
+                    align="center"
+                    width={isClosing ? 60 / zoom : 90 / zoom}
                 />
             </Group>
         )}
@@ -213,9 +378,75 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
     );
   };
 
+  const renderTempMeasureResult = () => {
+      if (!tempMeasureShape || !scale) return null;
+      
+      const zoom = stageRef.current?.scaleX() || 1;
+      const center = getShapeCenter(tempMeasureShape);
+      
+      let resultText = '';
+      if (tempMeasureShape.geometryType === 'linear') {
+          const len = getPolylineLength(tempMeasureShape.points) / scale;
+          resultText = formatMeters(len);
+      } else {
+          const area = getPolygonArea(tempMeasureShape.points) / (scale * scale);
+          resultText = formatSquareMeters(area);
+      }
+
+      // Calculate label box size roughly
+      const textWidth = resultText.length * 9;
+      
+      return (
+          <Group>
+              {/* The Shape itself */}
+              <Line 
+                  points={tempMeasureShape.points.flatMap(p => [p.x, p.y])}
+                  stroke="#ec4899"
+                  strokeWidth={4 / zoom}
+                  dash={[10, 5]}
+                  closed={tempMeasureShape.closed}
+                  fill={tempMeasureShape.geometryType === 'area' ? 'rgba(236, 72, 153, 0.2)' : undefined}
+              />
+               {/* Endpoints */}
+               {tempMeasureShape.points.map((p, i) => (
+                   <Circle key={i} x={p.x} y={p.y} radius={4/zoom} fill="#ec4899" stroke="white" strokeWidth={2/zoom} />
+               ))}
+
+              {/* The Floating Label */}
+              <Group x={center.x} y={center.y}>
+                   <Rect 
+                       x={-(textWidth/zoom + 20/zoom)/2}
+                       y={-(30/zoom)/2}
+                       width={textWidth/zoom + 30/zoom}
+                       height={30/zoom}
+                       fill="#ec4899"
+                       cornerRadius={8/zoom}
+                       shadowColor="black"
+                       shadowBlur={10}
+                       shadowOpacity={0.4}
+                       shadowOffsetY={5}
+                   />
+                   <Text 
+                       text={resultText}
+                       fontSize={14 / zoom}
+                       fontStyle="bold"
+                       fill="white"
+                       align="center"
+                       verticalAlign="middle"
+                       x={-(textWidth/zoom + 20/zoom)/2}
+                       y={-(30/zoom)/2}
+                       width={textWidth/zoom + 30/zoom}
+                       height={30/zoom}
+                   />
+              </Group>
+          </Group>
+      )
+  }
+
   const renderSnapIndicator = () => {
     if (!snappedPos) return null;
-    const r = 6 / (stageRef.current?.scaleX() || 1); // Raio menor para o indicador
+    const zoom = stageRef.current?.scaleX() || 1;
+    const r = 8 / zoom;
     return (
         <Group>
             <Circle 
@@ -223,7 +454,7 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
                 y={snappedPos.y} 
                 radius={r} 
                 stroke="#22c55e" 
-                strokeWidth={1.5} 
+                strokeWidth={2 / zoom} 
                 fillEnabled={false}
             />
              <Circle 
@@ -236,29 +467,67 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
     );
   };
 
-  // ResizeObserver para manter o canvas ajustado
+  const renderDeleteButton = (shape: Shape, matProps: any, zoom: number) => {
+      const center = getShapeCenter(shape);
+      const btnSize = 16 / zoom;
+      const offset = 15 / zoom;
+      
+      return (
+          <Group 
+            x={center.x + offset} 
+            y={center.y - offset}
+            onClick={(e) => {
+                e.cancelBubble = true;
+                onRemoveShape(shape.id);
+            }}
+            onTap={(e) => {
+                e.cancelBubble = true;
+                onRemoveShape(shape.id);
+            }}
+            onMouseEnter={(e) => {
+                const container = e.target.getStage()?.container();
+                if(container) container.style.cursor = 'pointer';
+            }}
+            onMouseLeave={(e) => {
+                const container = e.target.getStage()?.container();
+                if(container) container.style.cursor = 'default';
+            }}
+          >
+              <Circle 
+                radius={btnSize / 1.5}
+                fill="#ef4444"
+                stroke="white"
+                strokeWidth={2/zoom}
+                shadowColor="black"
+                shadowBlur={4}
+                shadowOpacity={0.3}
+              />
+               <Path
+                  data="M -3 -3 L 3 3 M 3 -3 L -3 3"
+                  x={0}
+                  y={0}
+                  stroke="white"
+                  strokeWidth={2/zoom}
+                  lineCap="round"
+               />
+          </Group>
+      )
+  }
+
   const [size, setSize] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const checkSize = () => {
       if (containerRef.current) {
-        setSize({
-          width: containerRef.current.offsetWidth,
-          height: containerRef.current.offsetHeight
-        });
+        setSize({ width: containerRef.current.offsetWidth, height: containerRef.current.offsetHeight });
       }
     };
-    
-    // Initial check
     checkSize();
-    
     const resizeObserver = new ResizeObserver(checkSize);
     if (containerRef.current) resizeObserver.observe(containerRef.current);
-    
     return () => resizeObserver.disconnect();
   }, []);
-
 
   return (
     <div ref={containerRef} className="w-full h-full bg-[#e5e5e5] overflow-hidden relative cursor-crosshair">
@@ -274,7 +543,7 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
           ref={stageRef}
           width={size.width}
           height={size.height}
-          draggable={tool === ToolType.SELECT}
+          draggable={mode === ToolMode.SELECT}
           onMouseDown={handleStageClick}
           onMouseMove={handleMouseMove}
           onDblClick={handleDoubleClick}
@@ -288,10 +557,8 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
               x: stage.getPointerPosition()!.x / oldScale - stage.x() / oldScale,
               y: stage.getPointerPosition()!.y / oldScale - stage.y() / oldScale,
             };
-
             const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
             stage.scale({ x: newScale, y: newScale });
-
             const newPos = {
               x: -(mousePointTo.x - stage.getPointerPosition()!.x / newScale) * newScale,
               y: -(mousePointTo.y - stage.getPointerPosition()!.y / newScale) * newScale,
@@ -300,36 +567,112 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
           }}
         >
           <Layer>
-            {image && <KonvaImage image={image} />}
+            {image && <KonvaImage image={image} name="bg-image" />}
           </Layer>
           <Layer>
-            {/* Render Committed Shapes */}
-            {shapes.map((shape) => (
-              <Group key={shape.id}>
-                {shape.type === ToolType.AREA ? (
-                   // Areas as closed shapes
-                   <Line
-                    points={shape.points.flatMap(p => [p.x, p.y])}
-                    fill={`${shape.color}40`} // Transparent fill
-                    stroke={shape.color}
-                    strokeWidth={2 / (stageRef.current?.scaleX() || 1)}
-                    closed={true}
-                   />
-                ) : (
-                   // Walls as polylines
-                   <Line
-                    points={shape.points.flatMap(p => [p.x, p.y])}
-                    stroke={shape.color}
-                    strokeWidth={4 / (stageRef.current?.scaleX() || 1)} // Thicker for walls
-                    lineCap="round"
-                    lineJoin="round"
-                    closed={false}
-                   />
-                )}
+            {shapes.map((shape) => {
+               if (shape.hidden) return null;
+               
+               // Resolve dynamic properties from the material list instead of hardcoding
+               const material = materials.find(m => m.id === shape.materialId);
+               const matWidth = material?.width || 0.05;
+               const matColor = material?.color || '#000000';
+               const matOpacity = material?.opacity;
 
-                {/* Labels for Wall Segments */}
-                {shape.type === ToolType.WALL && scale && (
-                    shape.points.slice(0, -1).map((p, i) => {
+               const zoom = stageRef.current?.scaleX() || 1;
+               const strokeWidth = Math.max(2 / zoom, (matWidth * (scale || 1)));
+               const isSelected = selectedShapeId === shape.id;
+
+               return (
+                <Group 
+                    key={shape.id}
+                    onClick={(e) => {
+                        if(mode === ToolMode.SELECT) {
+                            e.cancelBubble = true;
+                            onSelectShape(shape.id);
+                        }
+                    }}
+                    onTap={(e) => {
+                         if(mode === ToolMode.SELECT) {
+                            e.cancelBubble = true;
+                            onSelectShape(shape.id);
+                        }
+                    }}
+                    onMouseEnter={(e) => {
+                        if(mode === ToolMode.SELECT) {
+                            const container = e.target.getStage()?.container();
+                            if(container) container.style.cursor = 'pointer';
+                        }
+                    }}
+                    onMouseLeave={(e) => {
+                        const container = e.target.getStage()?.container();
+                        if(container) container.style.cursor = mode === ToolMode.SELECT ? 'default' : 'crosshair';
+                    }}
+                >
+                   {isSelected && shape.geometryType !== 'point' && (
+                       <Line 
+                            points={shape.points.flatMap(p => [p.x, p.y])}
+                            stroke="#06b6d4" 
+                            strokeWidth={strokeWidth + (4 / zoom)}
+                            opacity={0.5}
+                            closed={shape.geometryType === 'area'}
+                            lineJoin="round"
+                       />
+                   )}
+
+                   {shape.geometryType === 'point' ? (
+                       <Group>
+                           {shape.materialId === 'struct-pile' ? (
+                                <Circle 
+                                    x={shape.points[0].x}
+                                    y={shape.points[0].y}
+                                    radius={Math.max(10/zoom, (0.25 * (scale||1))) / 2} 
+                                    fill={matColor}
+                                    stroke={isSelected ? "#06b6d4" : "black"}
+                                    strokeWidth={(isSelected ? 2 : 1) / zoom}
+                                />
+                           ) : shape.materialId === 'struct-footing' ? (
+                               <Rect 
+                                    x={shape.points[0].x - (Math.max(20/zoom, 0.60 * (scale||1)))/2}
+                                    y={shape.points[0].y - (Math.max(20/zoom, 0.60 * (scale||1)))/2}
+                                    width={Math.max(20/zoom, 0.60 * (scale||1))}
+                                    height={Math.max(20/zoom, 0.60 * (scale||1))}
+                                    fill={matColor}
+                                    stroke={isSelected ? "#06b6d4" : "black"}
+                                    strokeWidth={(isSelected ? 2 : 1) / zoom}
+                               />
+                           ) : (
+                               <Rect 
+                                    x={shape.points[0].x - (Math.max(10/zoom, (matWidth) * (scale||1)))/2}
+                                    y={shape.points[0].y - (Math.max(10/zoom, (matWidth) * (scale||1)))/2}
+                                    width={Math.max(10/zoom, (matWidth) * (scale||1))}
+                                    height={Math.max(10/zoom, (matWidth) * (scale||1))}
+                                    fill={matColor}
+                                    stroke={isSelected ? "#06b6d4" : "black"}
+                                    strokeWidth={(isSelected ? 2 : 1) / zoom}
+                               />
+                           )}
+                       </Group>
+                   ) : shape.geometryType === 'area' ? (
+                       <Line
+                        points={shape.points.flatMap(p => [p.x, p.y])}
+                        fill={matOpacity ? `${matColor}${Math.floor(matOpacity * 255).toString(16).padStart(2,'0')}` : `${matColor}40`}
+                        stroke={matColor}
+                        strokeWidth={2 / zoom}
+                        closed={true}
+                       />
+                   ) : (
+                       <Line
+                        points={shape.points.flatMap(p => [p.x, p.y])}
+                        stroke={matColor}
+                        strokeWidth={strokeWidth}
+                        lineCap="butt"
+                        lineJoin="miter"
+                        closed={false}
+                       />
+                   )}
+
+                   {scale && shape.geometryType === 'linear' && shape.points.slice(0, -1).map((p, i) => {
                         const next = shape.points[i+1];
                         const midX = (p.x + next.x) / 2;
                         const midY = (p.y + next.y) / 2;
@@ -340,67 +683,45 @@ export const TakeoffCanvas: React.FC<TakeoffCanvasProps> = ({
                                 x={midX}
                                 y={midY}
                                 text={formatMeters(len)}
-                                fontSize={12 / (stageRef.current?.scaleX() || 1)}
+                                fontSize={10 / zoom}
                                 fill="black"
                                 stroke="white"
-                                strokeWidth={3}
-                                opacity={0.9}
+                                strokeWidth={2 / zoom}
                             />
                         )
-                    })
-                )}
-                
-                {/* Vertices for snapping visualization */}
-                {shape.points.map((p, i) => (
-                  <Circle
-                    key={`v-${shape.id}-${i}`}
-                    x={p.x}
-                    y={p.y}
-                    radius={3 / (stageRef.current?.scaleX() || 1)}
-                    fill="white"
-                    stroke={shape.color}
-                    strokeWidth={1}
-                  />
-                ))}
-              </Group>
-            ))}
+                    })}
+                    
+                    {isSelected && mode === ToolMode.SELECT && renderDeleteButton(shape, {}, zoom)}
+                </Group>
+               )
+            })}
             
-            {/* Render In-Progress Shape */}
             {renderCurrentShape()}
-            
-            {/* Render Snap Indicator (Magnet) */}
+            {renderTempMeasureResult()}
             {renderSnapIndicator()}
-
           </Layer>
         </Stage>
       )}
       
-      {tool === ToolType.SELECT && imageState && (
-          <div className="absolute top-4 right-4 bg-white/90 backdrop-blur border border-gray-200 shadow-sm px-3 py-1 rounded-md text-xs font-medium text-gray-600 pointer-events-none">
-            Modo Navegação (Arraste e Zoom)
-          </div>
-      )}
-      {tool !== ToolType.SELECT && imageState && (
-        <div className="absolute top-4 right-4 bg-white shadow-lg border-l-4 border-blue-500 px-4 py-3 rounded-md text-sm pointer-events-none text-gray-700 animate-in fade-in slide-in-from-top-2">
-           {tool === ToolType.CALIBRATE && (
-             <div className="flex flex-col">
-               <span className="font-bold text-gray-900">Calibração</span>
-               <span className="text-xs">Clique no início e fim de uma medida conhecida.</span>
-             </div>
-           )}
-           {tool === ToolType.WALL && (
-             <div className="flex flex-col">
-               <span className="font-bold text-gray-900">Medindo Paredes</span>
-               <span className="text-xs mt-1">Clique para pontos. <span className="font-semibold text-blue-600">Duplo clique</span> para finalizar.</span>
-               <span className="text-[10px] text-gray-400 mt-0.5">ESC para cancelar traço atual.</span>
-             </div>
-           )}
-           {tool === ToolType.AREA && (
-             <div className="flex flex-col">
-               <span className="font-bold text-gray-900">Medindo Área</span>
-               <span className="text-xs mt-1">Clique no <span className="font-semibold text-blue-600">Ponto Inicial</span> para fechar o polígono.</span>
-               <span className="text-[10px] text-gray-400 mt-0.5">ESC para cancelar área atual.</span>
-             </div>
+      {/* HUD Info */}
+      {mode !== ToolMode.SELECT && imageState && (
+        <div className="absolute top-4 right-4 bg-white shadow-lg border-l-4 border-blue-500 px-4 py-3 rounded-md text-sm pointer-events-none text-gray-700 animate-in fade-in slide-in-from-top-2 z-20">
+           {mode === ToolMode.CALIBRATE && <span className="font-bold">Modo Calibração</span>}
+           {mode === ToolMode.DRAW && (
+               <div>
+                   <span className="font-bold block text-gray-900">{selectedMaterial.name}</span>
+                   {selectedMaterial.category === 'measure' ? (
+                       <span className="text-xs text-gray-500">
+                           {selectedMaterial.type === 'linear' 
+                             ? 'Clique em dois pontos para medir.' 
+                             : 'Feche a forma para calcular a área.'}
+                       </span>
+                   ) : (
+                        <span className="text-xs text-gray-500">
+                            {selectedMaterial.type === 'point' ? 'Clique para posicionar' : 'Enter ou Duplo Clique p/ finalizar.'}
+                        </span>
+                   )}
+               </div>
            )}
         </div>
       )}

@@ -15,7 +15,9 @@
     "react-konva": "^19.2.1",
     "konva": "^10.0.12",
     "use-image": "^1.1.4",
-    "pdfjs-dist": "4.0.379"
+    "pdfjs-dist": "4.0.379",
+    "jspdf": "^3.0.4",
+    "jspdf-autotable": "^5.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
